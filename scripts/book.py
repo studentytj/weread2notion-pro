@@ -20,65 +20,6 @@ TAG_ICON_URL = "https://www.notion.so/icons/tag_gray.svg"
 USER_ICON_URL = "https://www.notion.so/icons/user-circle-filled_gray.svg"
 BOOK_ICON_URL = "https://www.notion.so/icons/book_gray.svg"
 
-
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
-def get_douban_url(title, isbn):
-    """
-    不知道怎么直接根据isbn获取douban的链接
-    直接曲线通过NeoDB来获取，But NeoDB有点数据不全
-    不一定能搜索到，而且通过名字搜索出来的书可能不对
-    """
-    query = isbn if isbn and isbn.strip() else title
-    print(f"search_neodb {title} {isbn} ")
-    params = {"query": query, "page": "1", "category": "book"}
-    print(query)
-    r = requests.get("https://neodb.social/api/catalog/search", params=params)
-    books = r.json().get("data")
-    if books is None or len(books) == 0:
-        return None
-    results = list(filter(lambda x: x.get("isbn") == query, books))
-    if len(results) == 0:
-        results = list(filter(lambda x: x.get("display_title") == query, books))
-    if len(results) == 0:
-        return None
-    result = results[0]
-    urls = list(
-        filter(
-            lambda x: x.get("url").startswith("https://book.douban.com"),
-            result.get("external_resources", []),
-        )
-    )
-    if len(urls) == 0:
-        return None
-    return urls[0].get("url")
-
-
-headers = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-}
-
-
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
-def douban_book_parse(link):
-    response = requests.get(link, headers=headers)
-    soup = BeautifulSoup(response.content)
-    result = {}
-    result["title"] = soup.find(property="v:itemreviewed").string
-    result["cover"] = soup.find(id="mainpic").img["src"]
-    authors = soup.find_all("li", class_="author")
-    authors = [
-        author.find("a", class_="name").string
-        for author in authors
-        if author.find("a", class_="name") is not None
-    ]
-    result["author"] = authors
-    info = soup.find(id="info")
-    info = list(map(lambda x: x.replace(":", "").strip(), info.stripped_strings))
-    if "ISBN" in info:
-        result["isbn"] = info[info.index("ISBN") + 1 :][0]
-    return result
-
-
 def insert_book_to_notion(books, index, bookId):
     """插入Book到Notion"""
     book = {}
@@ -95,43 +36,24 @@ def insert_book_to_notion(books, index, bookId):
     readInfo.update(readInfo.get("bookInfo", {}))
     book.update(readInfo)
     cover = book.get("cover")
-    author = book.get("author")
-    if author == "公众号":
-        if not cover.startswith("http"):
-            book["cover"] = BOOK_ICON_URL
-        if cover.startswith("http") and not cover.endswith(".jpg"):
-            book["cover"] = f"{cover}.jpg"
-        book["author"] = ["公众号"]
-    douban_url = book.get("douban_url")
-    """不是公众号并且douban链接为None"""
-    if author != "公众号" and (not douban_url or not douban_url.strip()):
-        douban_url = get_douban_url(book.get("title"), book.get("isbn"))
-    douban_book = None
-    if douban_url:
-        douban_book = douban_book_parse(douban_url)
-    if douban_book:
-        """获取的ISBN未必正确所以优先判断有ISBN没没有再从豆瓣拿"""
-        isbn = book.get("isbn")
-        book["douban_url"] = douban_url
-        if not isbn or not isbn.strip():
-            book["isbn"] = douban_book.get("isbn")
-        """微信读书的作者名有点恶心，从豆瓣取了"""
-        book["author"] = douban_book.get("author")
-        """自己传的书获取的封面Notion不能展示用douban的封面吧"""
-        if cover.startswith("http") and not cover.endswith(".jpg"):
-            book["cover"] = douban_book.get("cover")
+    if cover.startswith("http"):
+        if not cover.endswith(".jpg"):
+            cover = utils.upload_cover(cover)
         else:
-            """替换为高清图"""
-            book["cover"] = book.get("cover").replace("/s_", "/t7_")
-    elif author != "公众号":
-        book["author"] = book.get("author").split(" ")
-        """替换为高清图"""
-        book["cover"] = book.get("cover").replace("/s_", "/t7_")
+            cover = cover.replace("/s_", "/t7_")
+    else:
+        cover = BOOK_ICON_URL
+    book["cover"] = cover
     book["readingProgress"] = (
         100 if (book.get("markedStatus") == 4) else book.get("readingProgress", 0)
     ) / 100
-    status = {1: "想读", 4: "已读"}
-    book["status"] = status.get(book.get("markedStatus"), "在读")
+    markedStatus = book.get("markedStatus") 
+    status = "想读"
+    if(markedStatus==4):
+        status = "已读"
+    elif(book.get("readingTime",0)>=60):
+        status = "在读"
+    book["status"] = status
     date = None
     if book.get("finishedDate"):
         date = book.get("finishedDate")
@@ -140,19 +62,20 @@ def insert_book_to_notion(books, index, bookId):
     elif book.get("readingBookDate"):
         date = book.get("readingBookDate")
     book["date"] = date
-    book["author"] = [
-        notion_helper.get_relation_id(
-            x, notion_helper.author_database_id, USER_ICON_URL
-        )
-        for x in book.get("author")
-    ]
-    book["url"] = utils.get_weread_url(bookId)
-    if book.get("categories"):
-        book["categories"] = [
+    if bookId not in notion_books:
+        book["author"] = [
             notion_helper.get_relation_id(
-                x.get("title"), notion_helper.category_database_id, TAG_ICON_URL
+                x, notion_helper.author_database_id, USER_ICON_URL
             )
-            for x in book.get("categories")
+            for x in book.get("author").split(" ")
+        ]
+        book["url"] = utils.get_weread_url(bookId)
+        if book.get("categories"):
+            book["categories"] = [
+                notion_helper.get_relation_id(
+                    x.get("title"), notion_helper.category_database_id, TAG_ICON_URL
+                )
+                for x in book.get("categories")
         ]
     properties = utils.get_properties(
         book, book_properties_name_dict, book_properties_type_dict
@@ -198,9 +121,15 @@ if __name__ == "__main__":
     not_need_sync = []
     for key, value in notion_books.items():
         if (
-            key not in bookProgress
-            or value.get("readingTime") == bookProgress.get(key).get("readingTime")
-        ) and archive_dict.get(key) == value.get("category"):
+            (
+                key not in bookProgress
+                or value.get("readingTime") == bookProgress.get(key).get("readingTime")
+            )
+            and (archive_dict.get(key) == value.get("category"))
+            and value.get("cover")
+            and (not value.get("cover").endswith("/0.jpg"))
+            and (not value.get("cover").endswith("parsecover"))
+        ):
             not_need_sync.append(key)
     notebooks = weread_api.get_notebooklist()
     notebooks = [d["bookId"] for d in notebooks if "bookId" in d]
